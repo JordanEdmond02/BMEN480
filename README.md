@@ -5,9 +5,10 @@ READ ME
 
 
 ## Problem Statement:
+Reliance on 2D image slices for organ visualization, particularly in the context of bone analysis through CT scans, significantly limits the accuracy of anatomical assessments and understanding of anatomical structures. 
 
 ## Need Statement:
-
+Radiologists need to enhance radiology assessments of internal bone structure to increase the efficiency of treatment planning. 
 
 ## Necessary Packages to install:
 -dash 
