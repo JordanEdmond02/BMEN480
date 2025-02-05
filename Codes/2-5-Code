@@ -11,6 +11,9 @@ from pydicom import dcmread
 from skimage.filters import threshold_otsu
 from skimage.segmentation import clear_border
 from skimage.morphology import remove_small_objects, binary_closing, disk
+from skimage import measure
+import plotly.graph_objects as go
+import trimesh
 
 # Logos
 NCAT_Logo = "assets/NCATLogo.png"
@@ -18,13 +21,10 @@ NCAT_Logo = "assets/NCATLogo.png"
 # Header
 header = dbc.Navbar(
     dbc.Container(
-        dbc.Row(
-            [
-                dbc.Col(html.Img(src=NCAT_Logo, style={"height": "75px"}), width="auto"),
-                dbc.Col(
-                    html.H1("Bone-AFide-Scanners", style={"textAlign": "center", "font-size": "275%", "margin": "0"})),
-            ],
-        ),
+        dbc.Row([
+            dbc.Col(html.Img(src=NCAT_Logo, style={"height": "75px"}), width="auto"),
+            dbc.Col(html.H1("Bone-AFide-Scanners", style={"textAlign": "center", "font-size": "275%", "margin": "0"})),
+        ]),
     ),
     color="#95969A",
 )
@@ -60,15 +60,7 @@ def segmentation_over_all(segmentedslices):
     return segmented_slices
 
 
-def make_points(dicom_data, subset=0.02):
-    indices = np.argwhere(dicom_data > 0)
-    n_points = indices.shape[0]
-    ids = np.random.randint(low=0, high=n_points - 1, size=int(n_points * subset))
-    return indices[ids]
-
-
 def extract_zip_contents(zip_file_content, output_folder):
-    """Extracts the uploaded ZIP file to a temporary directory."""
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
 
@@ -83,13 +75,11 @@ server = app.server
 
 app.layout = html.Div([
     header,
-
-    # Upload Component
     html.Label("Upload DICOM ZIP File:"),
     dcc.Upload(
         id="upload-data",
         children=html.Button("Upload DICOM Folder (.zip)"),
-        multiple=False,  # Only one ZIP file at a time
+        multiple=False,
         style={
             "width": "50%",
             "height": "40px",
@@ -101,7 +91,6 @@ app.layout = html.Div([
             "margin": "10px auto",
         },
     ),
-
     html.Div(id="plotly-view", style={"height": "80vh", "width": "100%", "border": "1px solid #ccc"}),
 ])
 
@@ -113,9 +102,8 @@ app.layout = html.Div([
     prevent_initial_call=True,
 )
 def plotly_view(contents, filename):
-
     if not contents:
-        return dash.no_update  # Do nothing if no file is uploaded
+        return dash.no_update
 
     content_type, content_string = contents.split(",")
     decoded = base64.b64decode(content_string)
@@ -130,39 +118,38 @@ def plotly_view(contents, filename):
     slices_array = create_array(dicom_files)
     segmented_image_array = segmentation_over_all(slices_array)
 
-    points = make_points(segmented_image_array).astype(np.float32)
-    xyz = points.ravel()
-    x = xyz[::3]
-    y = xyz[1::3]
-    z = xyz[2::3]
+    # Generate the 3D mesh using Marching Cubes
+    verts, faces, _, _ = measure.marching_cubes(segmented_image_array, level=0)
 
-    # Create an interactive 3D scatter plot using plotly
-    fig = {
-        "data": [
-            {
-                "x": x,
-                "y": y,
-                "z": z,
-                "mode": "markers",
-                "marker": {"size": 3, "color": z, "colorscale": "Viridis", "opacity": 0.8},
-                "type": "scatter3d",
-            }
-        ],
-        "layout": {
-            "title": "3D Point Cloud",
-            "scene": {
-                "xaxis": {"title": "X"},
-                "yaxis": {"title": "Y"},
-                "zaxis": {"title": "Z"},
-            },
-            "showlegend": False,
-            "height": 700,
-            "width": 800,
-        },
-    }
+    # Extract x, y, z coordinates
+    x, y, z = verts.T
+    i, j, k = faces.T  # Triangle indices
 
-    # Return plotly plot
-    return dcc.Graph(figure=fig)
+    # Create a Mesh3D plot in Plotly
+    mesh_fig = go.Figure(
+        data=[
+            go.Mesh3d(
+                x=x, y=y, z=z,
+                i=i, j=j, k=k,
+                color='lightblue',
+                opacity=0.5
+            )
+        ]
+    )
+
+    mesh_fig.update_layout(
+        title="3D Bone Model",
+        scene=dict(
+            xaxis_title="X",
+            yaxis_title="Y",
+            zaxis_title="Z"
+        ),
+        height=700,
+        width=800
+    )
+
+    return dcc.Graph(figure=mesh_fig)
+
 
 if __name__ == "__main__":
     app.run_server(debug=True)
