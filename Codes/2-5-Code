@@ -1,0 +1,168 @@
+import dash
+import dash_bootstrap_components as dbc
+from dash import html, dcc, callback, Output, Input, State
+import numpy as np
+import os
+import zipfile
+import io
+import base64
+import pydicom as dicom
+from pydicom import dcmread
+from skimage.filters import threshold_otsu
+from skimage.segmentation import clear_border
+from skimage.morphology import remove_small_objects, binary_closing, disk
+
+# Logos
+NCAT_Logo = "assets/NCATLogo.png"
+
+# Header
+header = dbc.Navbar(
+    dbc.Container(
+        dbc.Row(
+            [
+                dbc.Col(html.Img(src=NCAT_Logo, style={"height": "75px"}), width="auto"),
+                dbc.Col(
+                    html.H1("Bone-AFide-Scanners", style={"textAlign": "center", "font-size": "275%", "margin": "0"})),
+            ],
+        ),
+    ),
+    color="#95969A",
+)
+
+
+def make_dicom_list(folderpath):
+    dicom_list = [file for file in os.listdir(folderpath) if file.endswith('.dcm')]
+    dicom_list = [dicom.dcmread(os.path.join(folderpath, file)) for file in dicom_list]
+    dicom_list = sorted(dicom_list, key=lambda x: int(x.InstanceNumber))
+    return dicom_list
+
+
+def create_array(dicom_index):
+    slices = np.zeros([512, 512, len(dicom_index)])
+    for i, slice in enumerate(dicom_index):
+        slices[:, :, i] = slice.pixel_array
+    return slices
+
+
+def segmentationprocess(image):
+    threshold = threshold_otsu(image)
+    binaryimage = image > threshold
+    clearedbinary = clear_border(binaryimage)
+    filteredbinary = remove_small_objects(clearedbinary, min_size=200)
+    smoothedbinary = binary_closing(filteredbinary, footprint=disk(5))
+    return smoothedbinary
+
+
+def segmentation_over_all(segmentedslices):
+    segmented_slices = np.zeros_like(segmentedslices)
+    for i in range(segmentedslices.shape[2]):
+        segmented_slices[:, :, i] = segmentationprocess(segmentedslices[:, :, i])
+    return segmented_slices
+
+
+def make_points(dicom_data, subset=0.02):
+    indices = np.argwhere(dicom_data > 0)
+    n_points = indices.shape[0]
+    ids = np.random.randint(low=0, high=n_points - 1, size=int(n_points * subset))
+    return indices[ids]
+
+
+def extract_zip_contents(zip_file_content, output_folder):
+    """Extracts the uploaded ZIP file to a temporary directory."""
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+
+    with zipfile.ZipFile(io.BytesIO(zip_file_content), "r") as zip_ref:
+        zip_ref.extractall(output_folder)
+
+    return output_folder
+
+
+app = dash.Dash(__name__)
+server = app.server
+
+app.layout = html.Div([
+    header,
+
+    # Upload Component
+    html.Label("Upload DICOM ZIP File:"),
+    dcc.Upload(
+        id="upload-data",
+        children=html.Button("Upload DICOM Folder (.zip)"),
+        multiple=False,  # Only one ZIP file at a time
+        style={
+            "width": "50%",
+            "height": "40px",
+            "lineHeight": "40px",
+            "borderWidth": "1px",
+            "borderStyle": "dashed",
+            "borderRadius": "5px",
+            "textAlign": "center",
+            "margin": "10px auto",
+        },
+    ),
+
+    html.Div(id="plotly-view", style={"height": "80vh", "width": "100%", "border": "1px solid #ccc"}),
+])
+
+
+@app.callback(
+    Output("plotly-view", "children"),
+    Input("upload-data", "contents"),
+    State("upload-data", "filename"),
+    prevent_initial_call=True,
+)
+def plotly_view(contents, filename):
+
+    if not contents:
+        return dash.no_update  # Do nothing if no file is uploaded
+
+    content_type, content_string = contents.split(",")
+    decoded = base64.b64decode(content_string)
+
+    if not filename.endswith(".zip"):
+        return html.Div("Error: Please upload a ZIP file containing DICOM images.")
+
+    upload_path = "./temp_uploads"
+    folderpath = extract_zip_contents(decoded, upload_path)
+
+    dicom_files = make_dicom_list(folderpath)
+    slices_array = create_array(dicom_files)
+    segmented_image_array = segmentation_over_all(slices_array)
+
+    points = make_points(segmented_image_array).astype(np.float32)
+    xyz = points.ravel()
+    x = xyz[::3]
+    y = xyz[1::3]
+    z = xyz[2::3]
+
+    # Create an interactive 3D scatter plot using plotly
+    fig = {
+        "data": [
+            {
+                "x": x,
+                "y": y,
+                "z": z,
+                "mode": "markers",
+                "marker": {"size": 3, "color": z, "colorscale": "Viridis", "opacity": 0.8},
+                "type": "scatter3d",
+            }
+        ],
+        "layout": {
+            "title": "3D Point Cloud",
+            "scene": {
+                "xaxis": {"title": "X"},
+                "yaxis": {"title": "Y"},
+                "zaxis": {"title": "Z"},
+            },
+            "showlegend": False,
+            "height": 700,
+            "width": 800,
+        },
+    }
+
+    # Return plotly plot
+    return dcc.Graph(figure=fig)
+
+if __name__ == "__main__":
+    app.run_server(debug=True)
