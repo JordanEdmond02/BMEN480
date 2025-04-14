@@ -143,7 +143,7 @@ def extract_zip_contents(zip_file_content, output_folder):
         zip_ref.extractall(output_folder)
     return output_folder
 
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP],suppress_callback_exceptions=True)
 server = app.server
 
 app.layout = html.Div([
@@ -177,7 +177,7 @@ app.layout = html.Div([
 )
 def plotly_view(contents, filename):
     if not contents:
-        return html.Div("Error: No file uploaded.")
+        return go.Figure()
 
     content_type, content_string = contents.split(",")
     decoded = base64.b64decode(content_string)
@@ -195,19 +195,19 @@ def plotly_view(contents, filename):
     slices_array = create_array(dicom_files)
     smoothed_slices = gaussian_filter(slices_array, sigma=2.0)  # Increased smoothing to reduce noise
     segmented_image_array = segmentation_over_all(smoothed_slices)
-    verts, faces, _, _ = measure.marching_cubes(segmented_image_array, level=0)
-    mesh = trimesh.Trimesh(vertices=verts, faces=faces)
-    trimesh.smoothing.filter_taubin(mesh, lamb=0.5, nu=-0.53, iterations=10)
+    verts, faces, _, _ = measure.marching_cubes(segmented_image_array, level=0,step_size=1) #uses measure.marching_cubes to extract 3D mesh from binary volume
+    mesh = trimesh.Trimesh(vertices=verts, faces=faces) #wraps raw mesh data into a trimesh object, defining faces and verticies
+    trimesh.smoothing.filter_taubin(mesh, lamb=0.5, nu=-0.53, iterations=10) #applies taubin smoothing for visuals, reduced noise and sharpened edges while preserving large scale features and makes it more suitable for downstream use
 
     # Ensure the OUTPUT_FOLDER exists before saving
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)  # Ensure the output folder exists
     stl_file_path = os.path.join(OUTPUT_FOLDER, "bone_model.stl")
     mesh.export(stl_file_path)
 
-    x, y, z = verts.T
-    i, j, k = faces.T
+    x, y, z = verts.T #transposes vertices matrix
+    i, j, k = faces.T #transposes faces matrix (triangle indices)
 
-    mesh_fig = go.Figure(
+    mesh_fig = go.Figure(   #figure is created
         data=[go.Mesh3d(x=x, y=y, z=z, i=i, j=j, k=k, color='lightblue', opacity=0.5)]
     )
     mesh_fig.update_layout(title="3D Bone Model", height=700, width=800)
@@ -252,7 +252,6 @@ def download_stl(n_clicks, filename):
             download_filename = "bone_model.stl"
 
         return dcc.send_file(stl_file_path, download_filename)
-
 
 
 if __name__ == "__main__":
