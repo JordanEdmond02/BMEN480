@@ -213,8 +213,9 @@ def plotly_view(contents, filename):
     i, j, k = faces.T
 
     mesh_fig = go.Figure(data=[go.Mesh3d(x=x, y=y, z=z, i=i, j=j, k=k, color='lightblue', opacity=0.5)])
+    mesh_fig.update_layout(height=700, width=800)
 
-    return dcc.Graph(figure=mesh_fig, id='mesh-fig')
+    return dcc.Graph(figure=mesh_fig, id='mesh-fig'),"✅ Upload successful!"
 
 # Point Table Callback
 @app.callback(
@@ -249,5 +250,3 @@ def download_stl(n_clicks, filename):
 
 if __name__ == "__main__":
     app.run(debug=True)
-
-
