@@ -1,0 +1,325 @@
+import dash
+import dash_bootstrap_components as dbc
+from dash import html, dcc, callback, Output, Input, State, dash_table
+import os
+import zipfile
+import io
+import numpy as np
+import base64
+import pandas as pd
+import pydicom as dicom
+from skimage.filters import threshold_otsu
+from skimage.segmentation import clear_border
+from skimage.morphology import remove_small_objects, binary_closing, disk
+from skimage import measure
+import plotly.graph_objects as go
+import trimesh
+from scipy.ndimage import gaussian_filter, binary_fill_holes
+import matplotlib.pyplot as plt
+
+# Logos
+NCAT_Logo = "assets/NCATLogo.png"
+JNJ_Logo = "assets/jjmt_logo.png"
+
+# File paths
+UPLOAD_FOLDER = './temp_uploads'
+OUTPUT_FOLDER = './temp_outputs'
+
+# Colors
+ncat_blue = "#36618e"
+ncat_gold = "#F1C40F"
+light_grey = "#EAEDED"
+
+# Header
+header = dbc.Navbar(
+    dbc.Container(
+        dbc.Row([
+            dbc.Col(html.Img(src=NCAT_Logo, style={"height": "75px"}), width="auto"),
+            dbc.Col(html.Img(src=JNJ_Logo, style={"height": "85px"}), width="auto"),
+            dbc.Col(html.H1("Bone-A-Fide-Scanners", style={"textAlign": "center", "font-size": "275%", "margin": "0"})),
+        ]),
+    ),
+    color=light_grey,
+)
+
+# Upload and Download Row
+download_row = dbc.Container(
+    dbc.Row([
+        dbc.Col(
+            dcc.Upload(
+                id="upload-data",
+                children=dbc.Button("Upload DICOM Folder (.zip)", style={"backgroundColor": ncat_blue, "color": "white"}),
+                multiple=False,
+                style={"width": "100%", "height": "40px", "lineHeight": "40px", "textAlign": "center", "margin": "10px auto"},
+            ),
+            width="auto"
+        ),
+        dbc.Col(
+            dcc.Input(id="filename-input", type="text", placeholder="Enter STL filename", debounce=True, style={"width": "100%"}),
+            width=3
+        ),
+        dbc.Col(
+            dbc.Button('Download STL', id='download-button', style={"backgroundColor": ncat_blue, "color": "white"}, n_clicks=0),
+            width="auto"
+        ),
+        dbc.Col(html.Div(id="save-status", style={"font-weight": "bold"}), width="auto"),
+        dbc.Col(html.Div(id="upload-status", style={"fontWeight": "bold", "color": "green"}), width="auto"),
+    ],
+    align="center",
+    justify="between",
+    style={"marginTop": "20px"}
+    )
+)
+
+def clean_old_files(folderpath):
+    if os.path.exists(folderpath):
+        for file in os.listdir(folderpath):
+            file_path = os.path.join(folderpath, file)
+            try:
+                if os.path.isfile(file_path):
+                    os.unlink(file_path)
+            except Exception as e:
+                print(f"Error deleting {file_path}: {e}")
+
+def make_dicom_list(folderpath):
+    dicom_list = []
+    for file in os.listdir(folderpath):
+        if file.endswith('.dcm'):
+            try:
+                dcm = dicom.dcmread(os.path.join(folderpath, file), force=True)
+                if "TransferSyntaxUID" not in dcm.file_meta:
+                    dcm.file_meta.TransferSyntaxUID = dicom.uid.ImplicitVRLittleEndian
+                if dcm.file_meta.TransferSyntaxUID.is_compressed:
+                    dcm.decompress()
+                dicom_list.append(dcm)
+            except Exception as e:
+                print(f"Error reading {file}: {e}")
+    return sorted(dicom_list, key=lambda x: int(getattr(x, 'InstanceNumber', 0)))
+
+def create_array(dicom_index):
+    arrays = []
+    for slice in dicom_index:
+        img = slice.pixel_array.astype(np.float32)
+        intercept = getattr(slice, "RescaleIntercept", 0)
+        slope = getattr(slice, "RescaleSlope", 1)
+        hu_img = img * slope + intercept
+        arrays.append(hu_img)
+    return np.stack(arrays, axis=-1)
+
+def segmentationprocess(image):
+    threshold = threshold_otsu(image)
+    binaryimage = image > threshold
+    clearedbinary = clear_border(binaryimage)
+    filteredbinary = remove_small_objects(clearedbinary, min_size=1000)
+    smoothedbinary = binary_closing(filteredbinary, footprint=disk(5))
+    return smoothedbinary
+
+def segmentation_over_all(segmentedslices):
+    return np.array([segmentationprocess(segmentedslices[:, :, i]) for i in range(segmentedslices.shape[2])]).transpose(1, 2, 0)
+
+def extract_zip_contents(zip_file_content, output_folder):
+    clean_old_files(output_folder)
+    os.makedirs(output_folder, exist_ok=True)
+    with zipfile.ZipFile(io.BytesIO(zip_file_content), "r") as zip_ref:
+        zip_ref.extractall(output_folder)
+    return output_folder
+
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP], suppress_callback_exceptions=True)
+server = app.server
+
+app.layout = dbc.Container([
+    header,
+
+    dbc.Container([
+        dbc.Card([
+            dbc.CardHeader("Upload and Download", style={"backgroundColor": ncat_blue, "color": "white"}),
+            dbc.CardBody(download_row)
+        ], className="mb-4 shadow-sm border-0"),
+
+        dbc.Row([
+            dbc.Col(
+                dbc.Card([
+                    dbc.CardHeader("3D Bone Model Viewer", style={"backgroundColor": ncat_blue, "color": "white"}),
+                    dbc.CardBody(html.Div(id="plotly-view"))
+                ], className="mb-5 shadow-sm border-0"),
+                width=8
+            ),
+            dbc.Col(
+                dbc.Card([
+                    dbc.CardHeader("Region of Interest (ROI)", style={"backgroundColor": ncat_blue, "color": "white"}),
+                    dbc.CardBody([
+                        html.Div(id='point-location'),
+                        dash_table.DataTable(
+                            id='point-table',
+                            columns=[
+                                {"name": "X", "id": "X"},
+                                {"name": "Y", "id": "Y"},
+                                {"name": "Z", "id": "Z"},
+                                {"name": "Notes (Press Enter to Save)", "id": "notes", "editable": True},
+                            ],
+                            data=[],
+                            export_format="xlsx",
+                            editable=True,
+                            row_deletable=True,
+                            style_table={"overflowX": "auto"},
+                            style_cell={"padding": "5px", "textAlign": "center"},
+                            style_header={
+                                "backgroundColor": ncat_blue,
+                                "fontWeight": "bold",
+                                "color": "white",
+                            },
+                        ),
+                    ])
+                ], className="mb-4 shadow-sm border-0"),
+                width=4
+            )
+        ], className="mb-4"),
+
+        dcc.Store(id="stored-points", data=[]),
+        dcc.Download(id="download-stl"),
+    ], fluid=True),
+], fluid=True, style={"backgroundColor": light_grey, "paddingBottom": "50px"})
+
+@app.callback(
+    Output("plotly-view", "children"),
+    Input("upload-data", "contents"),
+    State("upload-data", "filename"),
+    prevent_initial_call=True,
+)
+def plotly_view(contents, filename):
+    if not contents:
+        return go.Figure()
+
+    content_type, content_string = contents.split(",")
+    decoded = base64.b64decode(content_string)
+
+    if not filename.endswith(".zip"):
+        return html.Div("Error: Please upload a ZIP file containing DICOM images.")
+
+    upload_path = UPLOAD_FOLDER
+    folderpath = extract_zip_contents(decoded, upload_path)
+    dicom_files = make_dicom_list(folderpath)
+
+    if not dicom_files:
+        return html.Div("Error: No valid DICOM files found.")
+
+    slices_array = create_array(dicom_files)
+    smoothed_slices = gaussian_filter(slices_array, sigma=2.0)
+    segmented_image_array = segmentation_over_all(smoothed_slices)
+
+    # --- Confidence Map Calculation ---
+    confidence_volume = np.zeros_like(smoothed_slices)
+    for i in range(smoothed_slices.shape[2]):
+        slice_ = smoothed_slices[:, :, i]
+        threshold = threshold_otsu(slice_)
+        confidence = np.abs(slice_ - threshold)
+        confidence = (confidence - confidence.min()) / (confidence.max() - confidence.min() + 1e-5)
+        confidence_volume[:, :, i] = confidence
+
+    # Max Intensity Projection — Confidence as %
+    confidence_volume *= 100  # Convert to percentage
+
+    mip = np.max(confidence_volume, axis=2)
+    plt.figure(figsize=(6, 5))
+    plt.imshow(mip, cmap='hot')
+    plt.title('Segmentation Confidence Map (Max Projection)')
+    plt.colorbar(label='Confidence (%)', ticks=[0, 25, 50, 75, 100])
+    plt.tight_layout()
+
+    plt.savefig(os.path.join("/Users/jordanedmond/Desktop", "confidence_map.png"))
+    plt.close()
+
+    verts, faces, _, _ = measure.marching_cubes(segmented_image_array, level=0, step_size=1) #defines vertices and faces in mesh
+
+    mesh = trimesh.Trimesh(vertices=verts, faces=faces) #converts 3D binary volume into trianguler mesh
+    trimesh.smoothing.filter_taubin(mesh, lamb=0.5, nu=-0.53, iterations=10)  #keeps mesh close to original size while removing noise
+
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    stl_file_path = os.path.join(OUTPUT_FOLDER, "bone_model.stl")
+    mesh.export(stl_file_path)
+
+    x_max, y_max, z_max = slices_array.shape
+    def safe_index(val, max_val):
+        return np.clip(int(round(val)), 0, max_val - 1)
+
+    vertex_intensity = np.array([
+        slices_array[
+            safe_index(xi, x_max),
+            safe_index(yi, y_max),
+            safe_index(zi, z_max)
+        ] for xi, yi, zi in mesh.vertices
+    ])
+
+    x, y, z = mesh.vertices.T
+    i, j, k = mesh.faces.T
+
+    mesh_fig = go.Figure(data=[go.Mesh3d(
+        x=x, y=y, z=z,
+        i=i, j=j, k=k,
+        intensity=vertex_intensity,
+        colorscale='Viridis',
+        cmin=np.min(vertex_intensity),
+        cmax=np.max(vertex_intensity),
+        showscale=True,
+        opacity=0.6,
+        colorbar=dict(
+            title="Density (HU)",
+            titleside="right",
+            titlefont=dict(size=14),
+            tickfont=dict(size=12)
+        )
+    )])
+    mesh_fig.update_layout(height=700, width=800)
+
+    mid_index = slices_array.shape[2] // 2
+    middle_slice = slices_array[:, :, mid_index]
+    otsu_thresh = threshold_otsu(middle_slice)
+
+    plt.figure(figsize=(8, 5))
+    plt.hist(middle_slice.ravel(), bins=100, color='skyblue', edgecolor='black')
+    plt.axvline(otsu_thresh, color='red', linestyle='--', label=f"Otsu's Threshold = {otsu_thresh:.2f}")
+    plt.title("Histogram of Middle Slice Intensities with Otsu Threshold")
+    plt.xlabel("Intensity (HU)")
+    plt.ylabel("Pixel Count")
+    plt.legend()
+    plt.tight_layout()
+
+    desktop_path = "/Users/jordanedmond/Desktop"
+    os.makedirs(desktop_path, exist_ok=True)
+    plt.savefig(os.path.join(desktop_path, "otsu_threshold_histogram1.png"))
+    plt.close()
+
+
+    return dcc.Graph(figure=mesh_fig, id='mesh-fig')
+
+@app.callback(
+    Output("point-table", "data"),
+    Input("mesh-fig", "clickData"),
+    State("point-table", 'data'),
+    prevent_initial_call=True,
+)
+def update_table(click_data, table):
+    if click_data is None:
+        return table
+    if table is None:
+        table = []
+    point = click_data['points'][0]
+    new_row = {"X": point['x'], "Y": point['y'], "Z": point['z']}
+    table.append(new_row)
+    return table
+
+@app.callback(
+    Output("download-stl", "data"),
+    Input("download-button", "n_clicks"),
+    State("filename-input", "value"),
+    prevent_initial_call=True,
+)
+def download_stl(n_clicks, filename):
+    if n_clicks > 0:
+        os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+        stl_file_path = os.path.join(OUTPUT_FOLDER, "bone_model.stl")
+        download_filename = f"{filename}.stl" if filename else "bone_model.stl"
+        return dcc.send_file(stl_file_path, download_filename)
+
+if __name__ == "__main__":
+    app.run(debug=True)
